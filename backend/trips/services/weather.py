@@ -13,7 +13,9 @@ Request budget: the free API allows 600 calls/min and every location in a reques
     the finest coarser lattice that fits is used instead and the caller is told (see `Forecast.cell_deg`);
   * each cell's forecast window is anchored to the current UTC day (3, 6 or 10 days long) rather than to the
     departure, and cached; any cached window that covers a need is reused, so re-planning the same corridor
-    with another departure, load or interval usually costs no extra calls.
+    with another departure, load or interval usually costs no extra calls;
+  * if Open-Meteo returns 429 (minute/day quota), live fetches stop and we fall back to the 1 h cache, then a
+    24 h stale cache; remaining cells stay incomplete so the plan still returns with a degradation note.
 """
 
 from __future__ import annotations
@@ -22,7 +24,6 @@ import logging
 import math
 import time
 from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -38,10 +39,10 @@ LATTICES_DEG = (0.05, 0.1, 0.2, 0.3, 0.5)  # finest first
 HOUR = 3600
 DAY = 24 * HOUR
 WINDOW_TIERS_DAYS = (3, 6, 10)  # departure ≤ 7 days + trip + 48 h heatmap; < 14 days keeps a location 1 call
-CHUNK_SIZE = 50  # locations per request
-MAX_PARALLEL_REQUESTS = 3  # Open-Meteo rejects too many concurrent heavy requests from one IP
+CHUNK_SIZE = 50  # locations per request (fetched sequentially so a quota 429 can stop further calls)
 BUSY_RETRIES = 3
 CACHE_SECONDS = 60 * 60  # Open-Meteo refreshes its models hourly
+STALE_CACHE_SECONDS = 24 * 60 * 60  # kept after the hourly entry expires for quota fallback
 HOURLY_VARIABLES = "wind_speed_10m,rain,showers,snowfall"
 
 logger = logging.getLogger(__name__)
@@ -81,9 +82,19 @@ class Conditions:
 
 
 class Forecast:
-    def __init__(self, series: dict[Cell, dict[int, Hourly]], cell_deg: float = LATTICES_DEG[0]):
+    def __init__(
+        self,
+        series: dict[Cell, dict[int, Hourly]],
+        cell_deg: float = LATTICES_DEG[0],
+        *,
+        degraded: bool = False,
+        used_stale: bool = False,
+    ):
         self.series = series
         self.cell_deg = cell_deg
+        # True when the live API quota blocked a fetch and we fell back to cache / incomplete cells.
+        self.degraded = degraded
+        self.used_stale = used_stale
 
     def conditions(self, point: LatLng, ts: float) -> Conditions:
         hours = self.series.get(to_cell(point, self.cell_deg), {})
@@ -142,7 +153,11 @@ class WeatherClient:
     def forecast(
         self, points_and_times: Iterable[tuple[LatLng, float]], max_locations: int, now: float | None = None
     ) -> Forecast:
-        """Forecast covering every (point, unix time) pair, using at most `max_locations` locations."""
+        """Forecast covering every (point, unix time) pair, using at most `max_locations` locations.
+
+        When Open-Meteo's free quota is exhausted, we keep going with fresh cache, then 24 h stale cache,
+        and leave any remaining cells incomplete instead of failing the whole plan.
+        """
         points_and_times = list(points_and_times)
         if not points_and_times:
             return Forecast({})
@@ -150,27 +165,69 @@ class WeatherClient:
         windows = forecast_windows((h for hours in needs.values() for h in hours), now)
         start, end = windows[0]
 
-        def key(cell: Cell, window: tuple[int, int]) -> str:
+        def fresh_key(cell: Cell, window: tuple[int, int]) -> str:
             return "wx:{}:{}:{}:{}:{}".format(*cell, *window)
 
-        cached = cache.get_many([key(cell, w) for cell in needs for w in windows])
-        series = {}
+        def stale_key(cell: Cell, window: tuple[int, int]) -> str:
+            return "wxstale:{}:{}:{}:{}:{}".format(*cell, *window)
+
+        cached = cache.get_many([fresh_key(cell, w) for cell in needs for w in windows])
+        series: dict[Cell, dict[int, Hourly]] = {}
         for cell in needs:
-            hit = next((cached[key(cell, w)] for w in windows if key(cell, w) in cached), None)
+            hit = next((cached[fresh_key(cell, w)] for w in windows if fresh_key(cell, w) in cached), None)
             if hit is not None:
                 series[cell] = hit
 
         missing = sorted(cell for cell in needs if cell not in series)
         logger.info("weather: %d cells at %s°, %d cached, %d to fetch", len(needs), cell_deg, len(series), len(missing))
+        quota_hit = False
         chunks = [missing[i : i + CHUNK_SIZE] for i in range(0, len(missing), CHUNK_SIZE)]
-        if chunks:
-            with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_REQUESTS, len(chunks))) as pool:
-                for fetched in pool.map(lambda chunk: self._fetch_chunk(chunk, start, end), chunks):
-                    series.update(fetched)
-                    cache.set_many({key(cell, (start, end)): hrs for cell, hrs in fetched.items()}, CACHE_SECONDS)
-        return Forecast(series, cell_deg)
+        for chunk in chunks:
+            if quota_hit:
+                break
+            fetched, hit_quota = self._fetch_chunk(chunk, start, end)
+            if fetched:
+                series.update(fetched)
+                cache.set_many(
+                    {fresh_key(cell, (start, end)): hrs for cell, hrs in fetched.items()}, CACHE_SECONDS
+                )
+                cache.set_many(
+                    {stale_key(cell, (start, end)): hrs for cell, hrs in fetched.items()}, STALE_CACHE_SECONDS
+                )
+            if hit_quota:
+                quota_hit = True
+                logger.warning(
+                    "weather: Open-Meteo quota reached after %d/%d cells; falling back to stale cache",
+                    len(series),
+                    len(needs),
+                )
 
-    def _fetch_chunk(self, chunk: list[Cell], start: int, end: int) -> dict[Cell, dict[int, Hourly]]:
+        used_stale = False
+        still_missing = [cell for cell in needs if cell not in series]
+        if still_missing:
+            stale = cache.get_many([stale_key(cell, w) for cell in still_missing for w in windows])
+            for cell in still_missing:
+                hit = next(
+                    (stale[stale_key(cell, w)] for w in windows if stale_key(cell, w) in stale),
+                    None,
+                )
+                if hit is not None:
+                    series[cell] = hit
+                    used_stale = True
+
+        uncovered = len(needs) - len(series)
+        degraded = quota_hit or used_stale
+        if used_stale:
+            logger.info("weather: filled cells from stale (24h) cache after quota/miss")
+        if uncovered:
+            logger.info("weather: %d cells have no forecast (incomplete)", uncovered)
+
+        return Forecast(series, cell_deg, degraded=degraded, used_stale=used_stale)
+
+    def _fetch_chunk(
+        self, chunk: list[Cell], start: int, end: int
+    ) -> tuple[dict[Cell, dict[int, Hourly]], bool]:
+        """Fetch one batch. Returns (data, quota_hit). quota_hit means stop further live fetches."""
         centers = [cell_center(c) for c in chunk]
         params = {
             "latitude": ",".join(f"{lat:.2f}" for lat, _ in centers),
@@ -190,8 +247,8 @@ class WeatherClient:
                 response = self.http.get(f"{self.base_url}/v1/forecast", params=params)
             except httpx.HTTPError as exc:
                 raise UpstreamError("Weather service is unreachable.") from exc
-            # "Too many concurrent requests" clears in a moment; the per-minute quota does not, so only
-            # the former is retried.
+            # "Too many concurrent requests" clears in a moment; the per-minute / daily quota does not,
+            # so only the former is retried.
             if response.status_code == 429 and "concurrent" in _reason(response).lower() and attempt < BUSY_RETRIES:
                 time.sleep(0.4 * (attempt + 1))
                 continue
@@ -200,12 +257,12 @@ class WeatherClient:
             reason = _reason(response)
             logger.warning("Open-Meteo %s for %d locations: %s", response.status_code, len(chunk), reason)
             if response.status_code == 429:
-                raise UpstreamError(f"Weather service rate limit reached. {reason}".strip(), status_code=503)
+                return {}, True
             raise UpstreamError(f"Weather service error ({response.status_code}). {reason}".strip())
 
         payload = response.json()
         locations = payload if isinstance(payload, list) else [payload]
-        return {cell: self._parse_hourly(loc["hourly"]) for cell, loc in zip(chunk, locations)}
+        return {cell: self._parse_hourly(loc["hourly"]) for cell, loc in zip(chunk, locations)}, False
 
     @staticmethod
     def _parse_hourly(hourly: dict) -> dict[int, Hourly]:

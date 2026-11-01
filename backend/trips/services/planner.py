@@ -107,7 +107,18 @@ def compute_plan(
             f"To stay within the free weather API limit, checkpoint forecasts use a {forecast.cell_deg}° grid "
             f"(≈{forecast.cell_deg * 69:.0f} mi) instead of the default {LATTICES_DEG[0]}°."
         )
-    if incomplete:
+    if forecast.degraded:
+        if forecast.used_stale:
+            notes.append(
+                "Weather API quota was reached. Results use cached forecasts from earlier today where "
+                "available; checkpoints without a cache are marked incomplete (missing values treated as zero)."
+            )
+        else:
+            notes.append(
+                "Weather API quota was reached and no cached forecast was available. Checkpoints are marked "
+                "incomplete (missing values treated as zero). Retry later or set OPEN_METEO_API_KEY."
+            )
+    elif incomplete:
         notes.append("Some checkpoints are beyond the forecast horizon; missing values were treated as zero.")
     return {
         "recommendation": {

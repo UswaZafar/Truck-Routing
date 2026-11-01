@@ -124,10 +124,13 @@ class TestCreate:
         assert response.status_code == 422
         assert response.json()["code"] == "no_route"
 
-    def test_weather_quota_returns_503(self, api, providers):
+    def test_weather_quota_returns_plan_with_degraded_note(self, api, providers):
         providers.weather_status = 429
         response = create(api)
-        assert response.status_code == 503
+        assert response.status_code == 201
+        body = response.json()
+        assert any("quota" in note.lower() for note in body["notes"])
+        assert all(not cp["forecast_complete"] for route in body["routes"] for cp in route["checkpoints"])
 
 
 class TestRetrieveAndHeatmap:

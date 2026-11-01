@@ -2,7 +2,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from trips.exceptions import UpstreamError
+from django.core.cache import cache
+
 from trips.services.weather import (
     DAY,
     HOUR,
@@ -83,8 +84,30 @@ class TestClient:
         client.forecast([(p, ts + 6 * HOUR) for p, ts in pts], max_locations=500, now=T0)
         assert providers.calls["open-meteo"] == 3
 
-    def test_quota_error_becomes_503(self, providers):
+    def test_quota_falls_back_to_incomplete_without_cache(self, providers):
         providers.weather_status = 429
-        with pytest.raises(UpstreamError) as exc:
-            self.make(providers).forecast([(POINT, T0)], max_locations=10, now=T0)
-        assert exc.value.status_code == 503
+        fc = self.make(providers).forecast([(POINT, T0)], max_locations=10, now=T0)
+        assert fc.degraded is True
+        assert fc.used_stale is False
+        assert fc.series == {}
+        cond = fc.conditions(POINT, T0)
+        assert cond.complete is False
+
+    def test_quota_falls_back_to_stale_cache(self, providers):
+        providers.weather = lambda lat, lng, ts: (28.0, 0.0, 0.0, 0.0)
+        client = self.make(providers)
+        client.forecast([(POINT, T0)], max_locations=10, now=T0)
+        assert providers.calls["open-meteo"] == 1
+
+        providers.weather_status = 429
+        # Drop the fresh 1h entry but keep the 24h stale key so quota must use stale.
+        cell = to_cell(POINT, 0.05)
+        windows = forecast_windows([T0, T0 + HOUR], now=T0)
+        for w in windows:
+            cache.delete("wx:{}:{}:{}:{}:{}".format(*cell, *w))
+
+        fc = client.forecast([(POINT, T0)], max_locations=10, now=T0)
+        assert fc.degraded is True
+        assert fc.used_stale is True
+        assert fc.conditions(POINT, T0 + 600).wind_mph == 28.0
+        assert providers.calls["open-meteo"] == 2  # one success + one 429
