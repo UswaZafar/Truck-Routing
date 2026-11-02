@@ -100,9 +100,11 @@ class FakeProviders:
         self.weather = weather
         self.osrm_routes = osrm_routes
         self.osrm_status = osrm_status
-        self.calls: dict[str, int] = {"osrm": 0, "photon": 0, "open-meteo": 0}
+        self.calls: dict[str, int] = {"osrm": 0, "photon": 0, "open-meteo": 0, "open-meteo-geocode": 0}
         self.weather_locations = 0
         self.weather_status = 200
+        self.photon_status = 200
+        self.photon_error: Exception | None = None
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         host = request.url.host
@@ -121,6 +123,10 @@ class FakeProviders:
             return httpx.Response(200, json={"code": "Ok", "routes": [osrm_route_json(waypoints)]})
         if "photon" in host:
             self.calls["photon"] += 1
+            if self.photon_error is not None:
+                raise self.photon_error
+            if self.photon_status != 200:
+                return httpx.Response(self.photon_status, json={"message": "error"})
             q = request.url.params["q"].lower()
             if "nowhere" in q:
                 return httpx.Response(200, json={"features": []})
@@ -133,6 +139,27 @@ class FakeProviders:
                         {
                             "geometry": {"coordinates": [lng, lat]},
                             "properties": {"name": name, "state": "Texas", "country": "United States"},
+                        }
+                    ]
+                },
+            )
+        if "geocoding" in host:
+            self.calls["open-meteo-geocode"] += 1
+            q = (request.url.params.get("name") or "").lower()
+            if "nowhere" in q:
+                return httpx.Response(200, json={"results": []})
+            lat, lng = (32.7767, -96.797) if "dallas" in q else (29.7604, -95.3698)
+            name = "Dallas" if "dallas" in q else "Houston"
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "name": name,
+                            "latitude": lat,
+                            "longitude": lng,
+                            "admin1": "Texas",
+                            "country": "United States",
                         }
                     ]
                 },

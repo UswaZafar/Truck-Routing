@@ -115,12 +115,16 @@ REST_FRAMEWORK = {
 # Third-party providers (all keyless by default).
 OSRM_BASE_URL = os.environ.get("OSRM_BASE_URL", "https://router.project-osrm.org")
 PHOTON_BASE_URL = os.environ.get("PHOTON_BASE_URL", "https://photon.komoot.io")
+# Used when Photon is blocked/unreachable from the host (common on Render free IPs).
+OPEN_METEO_GEOCODE_BASE_URL = os.environ.get(
+    "OPEN_METEO_GEOCODE_BASE_URL", "https://geocoding-api.open-meteo.com"
+)
 OPEN_METEO_API_KEY = os.environ.get("OPEN_METEO_API_KEY", "")
 OPEN_METEO_BASE_URL = os.environ.get(
     "OPEN_METEO_BASE_URL",
     "https://customer-api.open-meteo.com" if OPEN_METEO_API_KEY else "https://api.open-meteo.com",
 )
-HTTP_TIMEOUT_SECONDS = float(os.environ.get("HTTP_TIMEOUT_SECONDS", "20"))
+HTTP_TIMEOUT_SECONDS = float(os.environ.get("HTTP_TIMEOUT_SECONDS", "30"))
 # Weather locations per plan: every location is one Open-Meteo call and the free tier allows 600/min,
 # so checkpoints + heatmap stay under that by default. A paid key lifts both budgets.
 WEATHER_CHECKPOINT_LOCATIONS = int(

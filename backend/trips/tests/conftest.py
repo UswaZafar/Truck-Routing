@@ -18,6 +18,7 @@ def providers(monkeypatch, settings):
     """Swap every provider's HTTP client for in-process fakes."""
     settings.OSRM_BASE_URL = "https://osrm.test"
     settings.PHOTON_BASE_URL = "https://photon.test"
+    settings.OPEN_METEO_GEOCODE_BASE_URL = "https://geocoding-api.open-meteo.test"
     settings.OPEN_METEO_BASE_URL = "https://api.open-meteo.test"
     settings.OPEN_METEO_API_KEY = ""
     fake = FakeProviders()

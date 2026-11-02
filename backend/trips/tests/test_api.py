@@ -57,7 +57,7 @@ class TestCreateValidation:
         response = create(api, **overrides)
         assert response.status_code == 400
         assert field in response.json()
-        assert providers.calls == {"osrm": 0, "photon": 0, "open-meteo": 0}
+        assert providers.calls == {"osrm": 0, "photon": 0, "open-meteo": 0, "open-meteo-geocode": 0}
 
     def test_missing_fields(self, api, providers):
         response = api.post("/api/trip-plans/", {}, format="json")
@@ -178,6 +178,17 @@ class TestGeocode:
         assert first.json()["results"][0] == {"label": "Dallas, Texas, United States", "lat": 32.7767, "lng": -96.797}
         api.get("/api/geocode/", {"q": "dallas"})
         assert providers.calls["photon"] == 1
+        assert providers.calls["open-meteo-geocode"] == 0
+
+    def test_falls_back_to_open_meteo_when_photon_unreachable(self, api, providers):
+        import httpx
+
+        providers.photon_error = httpx.ConnectError("blocked")
+        response = api.get("/api/geocode/", {"q": "Dallas"})
+        assert response.status_code == 200
+        assert response.json()["results"][0]["label"] == "Dallas, Texas, United States"
+        assert providers.calls["photon"] == 1
+        assert providers.calls["open-meteo-geocode"] == 1
 
     @pytest.mark.parametrize("params", [{}, {"q": "ab"}, {"q": "x" * 201}])
     def test_validates_query(self, api, providers, params):
