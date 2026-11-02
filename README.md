@@ -6,8 +6,7 @@ the truck's estimated arrival time at each checkpoint**, and classifies risk wit
 and load rules. It recommends a route (fewest No Travel → Severe → High miles → lowest average risk →
 shortest time) and draws everything on a map, with a **corridor weather heatmap and a 0–48 h forecast slider**.
 
-- **Live app:** _add the Render URL after deploying (see [Deploy](#deploy))_
-- **Walkthrough (Loom):** _add link_
+
 - **Requirement traceability:** [CHECKLIST.md](CHECKLIST.md) maps every line of the brief to code and tests.
 
 ![Plan view](docs/screenshot.png)
